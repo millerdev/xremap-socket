@@ -183,7 +183,7 @@ async fn handle_session(
     let listener = UnixListener::bind(&cfg.socket)?;
     let owner = get_user_by_name(&cfg.owner).ok_or_else(|| anyhow::anyhow!("User not found: {}", cfg.owner))?;
     std::os::unix::fs::chown(&cfg.socket, Some(owner.uid()), Some(owner.primary_group_id()))?;
-    fs::set_permissions(&cfg.socket, fs::Permissions::from_mode(0o660))?;
+    fs::set_permissions(&cfg.socket, fs::Permissions::from_mode(0o600))?;
     let user_socket = cfg.user_socket_path(uid);
     debug!("Session {} serving {:?} -> {:?}", session_id, cfg.socket, user_socket);
     loop {
