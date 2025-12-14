@@ -15,8 +15,9 @@ use users::get_user_by_name;
 use zbus::zvariant::OwnedObjectPath;
 use zbus::{Connection, MatchRule, MessageStream};
 
-
-/// Relay messages from XREMAP_SOCKET to /run/user/@UID/{basename(XREMAP_SOCKET)}.
+/// Relay from /run/xremap/gnome.sock to /run/user/{uid}/gnome.sock
+/// where {uid} is the id of the user with an active seated session.
+/// Behavior on systems with multiple concurrent seats is undefined.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -27,6 +28,10 @@ struct Args {
     /// Xremap socket owner
     #[arg(short, long, default_value = "xremap")]
     owner: String,
+
+    /// User socket pattern.
+    #[arg(short, long, default_value = "/run/users/{uid}/gnome.sock")]
+    user_socket: String,
 
     /// Enable debug logging. Repeat for more detail.
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -39,22 +44,22 @@ async fn main() -> Result<()> {
     let log_level = match args.verbose {0 => "info", 1 => "debug", _ => "trace"};
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
-    let xremap_socket = args.socket.clone();
-    let result = monitor_sessions(xremap_socket.clone(), args.owner).await;
+    let cfg = Config::new(args.socket, args.owner, args.user_socket);
+    let result = monitor_sessions(cfg.clone()).await;
 
-    if xremap_socket.exists() {
-        fs::remove_file(&xremap_socket)?;
-        debug!("Removed {:?}", xremap_socket);
+    if cfg.socket.exists() {
+        fs::remove_file(&cfg.socket)?;
+        debug!("Removed {:?}", cfg.socket);
     }
 
     result
 }
 
-async fn monitor_sessions(xremap_socket: PathBuf, owner: String) -> Result<()> {
+async fn monitor_sessions(cfg: Config) -> Result<()> {
     debug!("Monitoring D-Bus for new user sessions...");
 
-    if !xremap_socket.parent().map(|p| p.is_dir()).unwrap_or(false) {
-        anyhow::bail!("Socket directory not found: {:?}", xremap_socket);
+    if !cfg.socket.parent().map(|p| p.is_dir()).unwrap_or(false) {
+        anyhow::bail!("Socket directory not found: {:?}", cfg.socket);
     }
 
     let connection = Connection::system().await?;
@@ -62,7 +67,7 @@ async fn monitor_sessions(xremap_socket: PathBuf, owner: String) -> Result<()> {
     let active_sessions: Arc<Mutex<HashMap<String, JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    monitor_existing_sessions(&connection, &active_sessions, &xremap_socket, &owner).await?;
+    monitor_existing_sessions(&connection, &active_sessions, &cfg).await?;
 
     let session_new_rule = MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
@@ -94,8 +99,7 @@ async fn monitor_sessions(xremap_socket: PathBuf, owner: String) -> Result<()> {
                         let handle = spawn_session_handler(
                             session_id.clone(),
                             uid,
-                            xremap_socket.clone(),
-                            owner.clone(),
+                            cfg.clone(),
                         );
                         active_sessions.lock().await.insert(session_id, handle);
                     }
@@ -139,8 +143,7 @@ async fn get_seated_uid(
 async fn monitor_existing_sessions(
     connection: &Connection,
     active_sessions: &Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
-    xremap_socket: &PathBuf,
-    owner: &String,
+    cfg: &Config,
 ) -> Result<(), anyhow::Error> {
     let manager = ManagerProxy::new(connection).await?;
     let sessions = manager.list_sessions().await?;
@@ -150,8 +153,7 @@ async fn monitor_existing_sessions(
             let handle = spawn_session_handler(
                 session_id.clone(),
                 uid,
-                xremap_socket.clone(),
-                owner.clone(),
+                cfg.clone(),
             );
             active_sessions.lock().await.insert(session_id, handle);
         }
@@ -161,11 +163,10 @@ async fn monitor_existing_sessions(
 fn spawn_session_handler(
     session_id: String,
     uid: u32,
-    xremap_socket: PathBuf,
-    owner: String,
+    cfg: Config,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        match handle_session(session_id.clone(), uid, xremap_socket, owner).await {
+        match handle_session(session_id.clone(), uid, cfg).await {
             Ok(()) => debug!("Session {} monitor completed", session_id),
             Err(why) => error!("Session {} monitor failed: {}", session_id, why),
         }
@@ -175,26 +176,19 @@ fn spawn_session_handler(
 async fn handle_session(
     session_id: String,
     uid: u32,
-    xremap_socket: PathBuf,
-    owner: String,
+    cfg: Config,
 ) -> Result<()> {
     info!("Monitoring session {} for user {}", session_id, uid);
 
-    let user_socket = PathBuf::from(format!(
-        "/run/user/{}/{}",
-        uid,
-        xremap_socket.file_name().unwrap().to_string_lossy()
-    ));
-    if xremap_socket.exists() {
-        fs::remove_file(&xremap_socket)?;
+    if cfg.socket.exists() {
+        fs::remove_file(&cfg.socket)?;
     }
-
-    let listener = UnixListener::bind(&xremap_socket)?;
-    let user = get_user_by_name(&owner).ok_or_else(|| anyhow::anyhow!("User not found: {}", owner))?;
-    std::os::unix::fs::chown(&xremap_socket, Some(user.uid()), Some(user.primary_group_id()))?;
-    fs::set_permissions(&xremap_socket, fs::Permissions::from_mode(0o660))?;
-
-    debug!("Session {} serving {:?} -> {:?}", session_id, xremap_socket, user_socket);
+    let listener = UnixListener::bind(&cfg.socket)?;
+    let owner = get_user_by_name(&cfg.owner).ok_or_else(|| anyhow::anyhow!("User not found: {}", cfg.owner))?;
+    std::os::unix::fs::chown(&cfg.socket, Some(owner.uid()), Some(owner.primary_group_id()))?;
+    fs::set_permissions(&cfg.socket, fs::Permissions::from_mode(0o660))?;
+    let user_socket = cfg.user_socket_path(uid);
+    debug!("Session {} serving {:?} -> {:?}", session_id, cfg.socket, user_socket);
     loop {
         let (stream, _addr) = listener.accept().await?;
         trace!("Session {} relaying to {:?}", session_id, user_socket);
@@ -203,12 +197,12 @@ async fn handle_session(
     }
 }
 
-async fn relay_message(mut in_stream: UnixStream, socket_path: &Path) -> Result<()> {
-    if !socket_path.exists() {
-        trace!("Abort relay: {:?} does not exist", socket_path);
+async fn relay_message(mut in_stream: UnixStream, user_socket: &Path) -> Result<()> {
+    if !user_socket.exists() {
+        trace!("Abort relay: {:?} does not exist", user_socket);
         return Ok(());
     }
-    let mut out_stream = UnixStream::connect(socket_path).await?;
+    let mut out_stream = UnixStream::connect(user_socket).await?;
     let (mut in_read, mut in_write) = in_stream.split();
     let (mut out_read, mut out_write) = out_stream.split();
 
@@ -245,6 +239,27 @@ async fn relay_message(mut in_stream: UnixStream, socket_path: &Path) -> Result<
         res = relay_out => res?,
     }
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct Config {
+    socket: PathBuf,
+    owner: String,
+    user_socket: String,
+}
+
+impl Config {
+    fn new(socket: PathBuf, owner: String, user_socket: String) -> Config {
+        Config {
+            socket,
+            owner,
+            user_socket,
+        }
+    }
+
+    fn user_socket_path(&self, uid: u32) -> PathBuf {
+        PathBuf::from(self.user_socket.replace("{uid}", &uid.to_string()))
+    }
 }
 
 #[zbus::proxy(
