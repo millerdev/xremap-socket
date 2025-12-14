@@ -17,7 +17,6 @@ use zbus::names::BusName;
 use zbus::{Connection, MatchRule, MessageStream};
 
 
-
 /// Relay messages from XREMAP_SOCKET to /run/user/@UID/{basename(XREMAP_SOCKET)}.
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -58,14 +57,14 @@ async fn main() -> Result<()> {
 
 async fn monitor_sessions(xremap_socket: PathBuf, owner: String) -> Result<()> {
     debug!("Monitoring D-Bus for new user sessions...");
-    
+
     if !xremap_socket.parent().map(|p| p.is_dir()).unwrap_or(false) {
         anyhow::bail!("Socket directory not found: {:?}", xremap_socket);
     }
 
     let connection = Connection::system().await?;
     let proxy = zbus::fdo::DBusProxy::new(&connection).await?;
-    
+
     // Check if login1 service is available
     proxy
         .get_name_owner(BusName::from_static_str("org.freedesktop.login1")?)
@@ -78,7 +77,7 @@ async fn monitor_sessions(xremap_socket: PathBuf, owner: String) -> Result<()> {
     // List existing sessions
     let manager = ManagerProxy::new(&connection).await?;
     let sessions = manager.list_sessions().await?;
-    
+
     for (session_id, uid, _user, seat_id, _session_path) in sessions {
         if !seat_id.is_empty() {
             debug!("Existing session: {} (uid={}, seat={})", session_id, uid, seat_id);
@@ -119,12 +118,12 @@ async fn monitor_sessions(xremap_socket: PathBuf, owner: String) -> Result<()> {
                 "SessionNew" => {
                     let (session_id, session_path): (String, OwnedObjectPath) =
                         msg.body().deserialize()?;
-                    
+
                     let conn = connection.clone();
                     let xremap_socket_clone = xremap_socket.clone();
                     let owner_clone = owner.clone();
                     let active_sessions = active_sessions.clone();
-                    
+
                     tokio::spawn(async move {
                         match handle_new_session(
                             &conn,
@@ -154,7 +153,7 @@ async fn monitor_sessions(xremap_socket: PathBuf, owner: String) -> Result<()> {
                 "SessionRemoved" => {
                     let (session_id, _session_path): (String, OwnedObjectPath) =
                         msg.body().deserialize()?;
-                    
+
                     if let Some(handle) = active_sessions.lock().await.remove(&session_id) {
                         trace!("Session {} removed -> cancel monitor", session_id);
                         handle.abort();
@@ -195,7 +194,7 @@ async fn handle_new_session(
         .await?;
 
     let (seat_id, _seat_path) = session_proxy.seat().await?;
-    
+
     if !seat_id.is_empty() {
         let (uid, _user_path) = session_proxy.user().await?;
         Ok(Some((session_id, uid)))
@@ -212,7 +211,7 @@ async fn handle_session(
     owner: String,
 ) -> Result<()> {
     info!("Monitoring session {} for user {}", session_id, uid);
-    
+
     let user_socket = PathBuf::from(format!(
         "/run/user/{}/{}",
         uid,
@@ -229,7 +228,7 @@ async fn handle_session(
     // Set ownership and permissions
     let user = get_user_by_name(&owner)
         .ok_or_else(|| anyhow::anyhow!("User not found: {}", owner))?;
-    
+
     std::os::unix::fs::chown(&xremap_socket, Some(user.uid()), Some(user.primary_group_id()))?;
     fs::set_permissions(&xremap_socket, fs::Permissions::from_mode(0o660))?;
 
@@ -325,7 +324,7 @@ trait Manager {
 trait Session {
     #[zbus(property)]
     fn seat(&self) -> zbus::Result<(String, OwnedObjectPath)>;
-    
+
     #[zbus(property)]
     fn user(&self) -> zbus::Result<(u32, OwnedObjectPath)>;
 }
