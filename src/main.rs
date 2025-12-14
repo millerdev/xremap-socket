@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use users::get_user_by_name;
@@ -30,7 +31,7 @@ struct Args {
     owner: String,
 
     /// User socket pattern.
-    #[arg(short, long, default_value = "/run/users/{uid}/gnome.sock")]
+    #[arg(short, long, default_value = "/run/user/{uid}/gnome.sock")]
     user_socket: String,
 
     /// Enable debug logging. Repeat for more detail.
@@ -45,13 +46,9 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
     let cfg = Config::new(args.socket, args.owner, args.user_socket);
+    setup_signal_handlers(cfg.clone());
     let result = monitor_sessions(cfg.clone()).await;
-
-    if cfg.socket.exists() {
-        fs::remove_file(&cfg.socket)?;
-        debug!("Removed {:?}", cfg.socket);
-    }
-
+    cleanup_socket(&cfg);
     result
 }
 
@@ -239,6 +236,33 @@ async fn relay_message(mut in_stream: UnixStream, user_socket: &Path) -> Result<
         res = relay_out => res?,
     }
     Ok(())
+}
+
+fn setup_signal_handlers(cfg: Config) {
+    tokio::spawn(async move {
+        let mut sigterm = signal(SignalKind::terminate()).expect("Failed to setup SIGTERM handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("Failed to setup SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => {
+                debug!("Received SIGTERM");
+            }
+            _ = sigint.recv() => {
+                debug!("Received SIGINT");
+            }
+        }
+        cleanup_socket(&cfg);
+        std::process::exit(0);
+    });
+}
+
+fn cleanup_socket(cfg: &Config) {
+    if cfg.socket.exists() {
+        if let Err(why) = fs::remove_file(&cfg.socket) {
+            error!("Failed to remove {:?}: {}", cfg.socket, why);
+        } else {
+            debug!("Removed {:?}", cfg.socket);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
