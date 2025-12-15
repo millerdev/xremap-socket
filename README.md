@@ -1,10 +1,12 @@
 # xremap-socket relay
 
-Relay messages from xremap system service to xremap-gnome user service.
+Relay messages from xremap system service to xremap-gnome GNOME extension.
 
 Allow xremap to be configured and run as a system user with limited permissions
-while maintaining the ability to query the active window of a user sesion with
-control of the keyboard. Currently only GNOME is supported.
+while maintaining the ability to query the active window of a user with an
+active seated session.
+
+Behavior is undefined when there are multiple active seated sessions.
 
 ## System configuration to run xremap as a dedicated system user
 

@@ -8,10 +8,10 @@ import asyncio as aio
 import logging
 import os
 import pwd
-from functools import partial
+from dataclasses import dataclass
 from pathlib import Path
 
-from dbus_next.aio import MessageBus
+from dbus_next.aio import MessageBus, ProxyObject
 from dbus_next.constants import BusType
 
 log = logging.getLogger('xremap')
@@ -35,6 +35,11 @@ async def main():
         help="Xremap socket owner"
     )
     parser.add_argument(
+        "-u", "--user-socket",
+        default="/run/user/{uid}/gnome.sock",
+        help="User socket pattern"
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="count",
         default=0,
@@ -47,96 +52,133 @@ async def main():
     logging.basicConfig(level=debug if args.verbose else logging.INFO)
 
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-    try:
-        await monitor_sessions(bus, xremap_socket, args.owner)
-    finally:
-        if xremap_socket.exists():
-            xremap_socket.unlink()
-            log.debug("Removed %s", xremap_socket)
+    await monitor_sessions(bus, xremap_socket, args.owner, args.user_socket)
 
 
-async def monitor_sessions(bus: MessageBus, xremap_socket: Path, owner: str):
+async def monitor_sessions(bus: MessageBus, xremap_socket: Path, owner: str, user_socket_pattern: str):
     """Watch for SessionNew signals on D-Bus"""
     log.debug("Monitoring D-Bus for new user sessions...")
-    if not xremap_socket.parent.is_dir():
-        raise ValueError(f"Socket directory not found: {xremap_socket}")
-
     proxy = bus.get_proxy_object(
         "org.freedesktop.login1",
         "/org/freedesktop/login1",
         await bus.introspect("org.freedesktop.login1", "/org/freedesktop/login1"),
     )
     manager = proxy.get_interface("org.freedesktop.login1.Manager")
-    active = {}
-    the_end = aio.get_event_loop().create_future()
+    sessions = {}
+    active_sessions = {}
 
-    def on_session_new(session_id, session_path):
-        assert session_id not in active, session_id
-        task = active[session_id] = aio.create_task(
-            handle_new_session(bus, session_id, session_path, xremap_socket, owner))
-        task.add_done_callback(partial(on_session_end, session_id))
+    async def on_session_new(session_id, session_path):
+        assert session_id not in sessions, session_id
+        session = await handle_new_session(
+            bus, session_id, session_path, user_socket_pattern, on_properties_changed)
+        if session is not None:
+            sessions[session_id] = session
+            if await session.is_active():
+                active_sessions[session_id] = session
+
+    def on_properties_changed(session, is_active):
+        if is_active:
+            log.info("Activated session %s", session.id)
+            active_sessions[session.id] = session
+        else:
+            log.info("Deactivated session %s", session.id)
+            active_sessions.pop(session.id, None)
 
     def on_session_removed(session_id, session_path):
-        if session_id in active:
-            log.trace("Session %s removed -> cancel monitor", session_id)
-            active[session_id].cancel()
+        session = sessions.pop(session_id, None)
+        active_ = active_sessions.pop(session_id, None)
+        active = " active" if active_ is not None else ""
+        if session is not None:
+            session.finalize()
+            log.trace("Session%s %s removed", active, session_id)
+        elif active:
+            active_.finalize()
+            log.warning("Discarded unknown active session: %s", session_id)
 
-    def on_session_end(session_id, task: aio.Task):
-        active.pop(session_id)
-        try:
-            task.result()
-            log.debug("Session %s monitor completed", session_id)
-        except aio.CancelledError:
-            log.debug("Session %s monitor cancelled", session_id)
-        except Exception:
-            log.exception("Session %s monitor failed", session_id)
-            the_end.set_result(True)
+    def get_active_session():
+        if len(active_sessions) > 1:
+            log.warning("Unexpected: multiple active sessions: %s", active_sessions.keys())
+            return None
+        return next(iter(active_sessions.values()), None)
 
-    sessions = await manager.call_list_sessions()
-    for session_id, uid, user, seat_id, session_path in sessions:
+    current_sessions = await manager.call_list_sessions()
+    for session_id, uid, user, seat_id, session_path in current_sessions:
         if seat_id:
             log.debug(f"Existing session: {session_id} (uid={uid}, seat={seat_id})")
-            assert session_id not in active, session_id
-            task = active[session_id] = aio.create_task(
-                handle_session(session_id, uid, xremap_socket, owner))
-            task.add_done_callback(partial(on_session_end, session_id))
+            assert session_id not in sessions, session_id
+            session = sessions[session_id] = await handle_session(
+                bus, session_id, session_path, uid, user_socket_pattern, on_properties_changed)
+            if await session.is_active():
+                active_sessions[session_id] = session
 
     manager.on_session_new(on_session_new)
     manager.on_session_removed(on_session_removed)
-    await the_end
+    await socket_server(xremap_socket, owner, get_active_session)
 
 
-async def handle_new_session(bus: MessageBus, session_id, session_path: str, xremap_socket: Path, owner: str):
-    session_proxy = bus.get_proxy_object(
+async def handle_new_session(
+    bus: MessageBus,
+    session_id: str,
+    session_path: str,
+    *args,
+):
+    proxy = bus.get_proxy_object(
         "org.freedesktop.login1",
         session_path,
         await bus.introspect("org.freedesktop.login1", session_path),
     )
-    session = session_proxy.get_interface("org.freedesktop.login1.Session")
-    seat_id = (await session.get_seat())[0]
+    bus_session = proxy.get_interface("org.freedesktop.login1.Session")
+    seat_id = (await bus_session.get_seat())[0]
     if seat_id:
-        uid = (await session.get_user())[0]
-        await handle_session(session_id, uid, xremap_socket, owner)
-    else:
-        log.debug("Ignoring unseated session %s", session_id)
+        uid = (await bus_session.get_user())[0]
+        return await handle_session(bus, session_id, session_path, uid, *args)
+    log.debug("Ignoring unseated session %s", session_id)
+    return None
 
 
-async def handle_session(session_id, uid: int, xremap_socket: Path, owner: str):
-    log.info("Monitoring session %s for user %s", session_id, uid)
-    user_socket = Path(f"/run/user/{uid}/{xremap_socket.name}")
+async def handle_session(
+    bus: MessageBus,
+    session_id: str,
+    session_path: str,
+    uid: int,
+    user_socket_pattern: str,
+    on_properties_changed: callable,
+):
+    proxy = bus.get_proxy_object(
+        "org.freedesktop.login1",
+        session_path,
+        await bus.introspect("org.freedesktop.login1", session_path),
+    )
+    user_socket = Path(user_socket_pattern.format(uid=uid))
+    session = Session(session_id, user_socket, proxy, on_properties_changed)
+    active = " active" if await session.is_active() else ""
+    log.info("Monitoring%s session %s for user %s", active, session_id, uid)
+    return session
 
+
+async def socket_server(xremap_socket: Path, owner: str, get_active_session):
     async def handle_connect(*args):
-        log.trace("Session %s relaying to %s", session_id, user_socket)
-        await relay_message(user_socket, *args)
-        log.trace("Session %s relay completed", session_id)
+        session = get_active_session()
+        if session is None:
+            log.trace("No active session")
+            return
+        log.trace("Relaying to session %s on %s", session.id, session.user_socket)
+        await relay_message(session.user_socket, *args)
 
+    if not xremap_socket.parent.is_dir():
+        raise ValueError(f"Socket directory not found: {xremap_socket}")
     server = await aio.start_unix_server(handle_connect, xremap_socket)
     user = pwd.getpwnam(owner)
     os.chown(xremap_socket, user.pw_uid, user.pw_gid)
     os.chmod(xremap_socket, 0o660)
-    async with server:
-        log.debug("Session %s serving %s -> %s", session_id, xremap_socket, user_socket)
-        await server.serve_forever()
+    try:
+        async with server:
+            log.debug("Serving to %s", xremap_socket)
+            await server.serve_forever()
+    finally:
+        if xremap_socket.exists():
+            xremap_socket.unlink()
+            log.debug("Removed %s", xremap_socket)
 
 
 async def relay_message(socket_path: Path, in_reader: aio.StreamReader, in_writer: aio.StreamWriter):
@@ -160,6 +202,7 @@ async def relay_message(socket_path: Path, in_reader: aio.StreamReader, in_write
     finally:
         in_writer.close()
         await in_writer.wait_closed()
+    log.trace("Relay to %s completed", socket_path)
 
 
 class add_trace_logging_level():
@@ -169,6 +212,34 @@ class add_trace_logging_level():
 
     logging.Logger.trace = trace
     logging.addLevelName(TRACE, "TRACE")
+
+
+@dataclass
+class Session:
+    id: str
+    user_socket: Path
+    proxy: ProxyObject
+    on_properties_changed: callable
+
+    def __post_init__(self):
+        self.bus_session = self.proxy.get_interface("org.freedesktop.login1.Session")
+        self.props = self.proxy.get_interface("org.freedesktop.DBus.Properties")
+        self.props.on_properties_changed(self._on_properties_changed)
+
+    async def is_active(self):
+        return await self.bus_session.get_active()
+
+    def _on_properties_changed(self, interface, changed, invalidated):
+        log.trace("Session %s properties changed: %r", self.id, changed)
+        active = changed.get("Active")
+        if active is not None:
+            self.on_properties_changed(self, active.value)
+
+    def finalize(self):
+        try:
+            self.props.off_properties_changed(self._on_properties_changed)
+        except Exception:
+            log.exception("Unable to finalize session %s", self.id)
 
 
 class CannotConnect(Exception):
