@@ -1,7 +1,7 @@
 use anyhow::{Result};
 use clap::Parser;
 use futures_util::stream::StreamExt;
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -13,7 +13,8 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use users::get_user_by_name;
-use zbus::zvariant::OwnedObjectPath;
+use zbus::fdo::DBusProxy;
+use zbus::zvariant::{OwnedObjectPath, Value};
 use zbus::{Connection, MatchRule, MessageStream};
 
 /// Relay from /run/xremap/gnome.sock to /run/user/{uid}/gnome.sock
@@ -46,7 +47,7 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
     let cfg = Config::new(args.socket, args.owner, args.user_socket);
-    setup_signal_handlers(cfg.clone());
+    setup_process_signal_handlers(cfg.clone());
     let result = monitor_sessions(cfg.clone()).await;
     cleanup_socket(&cfg);
     result
@@ -60,11 +61,11 @@ async fn monitor_sessions(cfg: Config) -> Result<()> {
     }
 
     let connection = Connection::system().await?;
-    let proxy = zbus::fdo::DBusProxy::new(&connection).await?;
+    let proxy = DBusProxy::new(&connection).await?;
     let active_sessions: Arc<Mutex<HashMap<String, JoinHandle<()>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    monitor_existing_sessions(&connection, &active_sessions, &cfg).await?;
+    monitor_existing_sessions(&connection, proxy.clone(), &active_sessions, &cfg).await?;
 
     let session_new_rule = MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
@@ -88,29 +89,45 @@ async fn monitor_sessions(cfg: Config) -> Result<()> {
                     let (session_id, session_path): (String, OwnedObjectPath) =
                         msg.body().deserialize()?;
 
-                    if let Some(uid) = get_seated_uid(
+                    if let Some(uid) = get_active_seated_uid(
                         &connection.clone(),
                         session_id.clone(),
-                        session_path,
+                        session_path.clone(),
                     ).await? {
                         let handle = spawn_session_handler(
+                            proxy.clone(),
                             session_id.clone(),
+                            session_path,
                             uid,
                             cfg.clone(),
-                        );
+                        ).await?;
                         active_sessions.lock().await.insert(session_id, handle);
                     }
                 }
                 "SessionRemoved" => {
-                    let (session_id, _session_path): (String, OwnedObjectPath) =
+                    let (session_id, session_path): (String, OwnedObjectPath) =
                         msg.body().deserialize()?;
 
                     if let Some(handle) = active_sessions.lock().await.remove(&session_id) {
                         trace!("Session {} removed -> cancel monitor", session_id);
                         handle.abort();
                     }
+                    let session_changed_rule = MatchRule::builder()
+                        .msg_type(zbus::message::Type::Signal)
+                        .interface("org.freedesktop.DBus.Properties")?
+                        .member("PropertiesChanged")?
+                        .path(session_path)?
+                        .build();
+                    proxy.remove_match_rule(session_changed_rule).await?;
                 }
-                _ => {}
+                "PropertiesChanged" => {
+                    let body = msg.body();
+                    let (name, props, stuff): (String, HashMap<String, Value<'_>>, Vec<String>) =
+                        body.deserialize()?;
+
+                    debug!("Session {} properties changed: {:?} {:?}", name, props, stuff);
+                }
+                sig => warn!("Ignored signal: {}", sig)
             }
         }
     }
@@ -118,56 +135,75 @@ async fn monitor_sessions(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-async fn get_seated_uid(
+async fn get_active_seated_uid(
     connection: &Connection,
     session_id: String,
     session_path: OwnedObjectPath,
 ) -> Result<Option<u32>> {
-    let session_proxy = SessionProxy::builder(connection)
-        .path(session_path)?
-        .build()
-        .await?;
+    let session_proxy = SessionProxy::builder(connection).path(session_path)?.build().await?;
     let (seat_id, _seat_path) = session_proxy.seat().await?;
-    if !seat_id.is_empty() {
+    if !seat_id.is_empty() && session_proxy.active().await? {
         let (uid, _user_path) = session_proxy.user().await?;
         Ok(Some(uid))
     } else {
-        debug!("Ignoring unseated session {}", session_id);
+        debug!("Ignoring unseated or inactive session {}", session_id);
         Ok(None)
     }
 }
 
+async fn is_active(
+    connection: &Connection,
+    session_path: &OwnedObjectPath,
+) -> Result<bool> {
+    let session_proxy = SessionProxy::builder(connection).path(session_path)?.build().await?;
+    Ok(session_proxy.active().await?)
+}
+
 async fn monitor_existing_sessions(
     connection: &Connection,
+    proxy: DBusProxy<'static>,
     active_sessions: &Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     cfg: &Config,
 ) -> Result<(), anyhow::Error> {
     let manager = ManagerProxy::new(connection).await?;
     let sessions = manager.list_sessions().await?;
-    Ok(for (session_id, uid, _user, seat_id, _session_path) in sessions {
-        if !seat_id.is_empty() {
+    Ok(for (session_id, uid, _user, seat_id, session_path) in sessions {
+        if !seat_id.is_empty() && is_active(connection, &session_path).await? {
             debug!("Existing session: {} (uid={})", session_id, uid);
             let handle = spawn_session_handler(
+                proxy.clone(),
                 session_id.clone(),
+                session_path,
                 uid,
                 cfg.clone(),
-            );
+            ).await?;
             active_sessions.lock().await.insert(session_id, handle);
         }
     })
 }
 
-fn spawn_session_handler(
+async fn spawn_session_handler(
+    proxy: DBusProxy<'static>,
     session_id: String,
+    session_path: OwnedObjectPath,
     uid: u32,
     cfg: Config,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+) -> Result<JoinHandle<()>> {
+    let session_changed_rule = MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface("org.freedesktop.DBus.Properties")?
+        .path(session_path)?
+        .member("PropertiesChanged")?
+        .build();
+
+    proxy.add_match_rule(session_changed_rule.clone()).await?;
+
+    Ok(tokio::spawn(async move {
         match handle_session(session_id.clone(), uid, cfg).await {
             Ok(()) => debug!("Session {} monitor completed", session_id),
             Err(why) => error!("Session {} monitor failed: {}", session_id, why),
         }
-    })
+    }))
 }
 
 async fn handle_session(
@@ -238,7 +274,7 @@ async fn relay_message(mut in_stream: UnixStream, user_socket: &Path) -> Result<
     Ok(())
 }
 
-fn setup_signal_handlers(cfg: Config) {
+fn setup_process_signal_handlers(cfg: Config) {
     tokio::spawn(async move {
         let mut sigterm = signal(SignalKind::terminate()).expect("Failed to setup SIGTERM handler");
         let mut sigint = signal(SignalKind::interrupt()).expect("Failed to setup SIGINT handler");
@@ -305,4 +341,7 @@ trait Session {
 
     #[zbus(property)]
     fn user(&self) -> zbus::Result<(u32, OwnedObjectPath)>;
+
+    #[zbus(property)]
+    fn active(&self) -> zbus::Result<bool>;
 }
