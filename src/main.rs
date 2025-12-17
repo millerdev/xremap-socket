@@ -3,9 +3,8 @@ mod monitor;
 use anyhow::{Result};
 use defer::defer;
 use clap::Parser;
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, trace};
 use monitor::SessionMonitor;
-use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -13,9 +12,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::RwLock;
 use users::get_user_by_name;
-use zbus::zvariant::OwnedObjectPath;
 
 /// Relay from /run/xremap/gnome.sock to /run/user/{uid}/gnome.sock
 /// where {uid} is the id of the user with an active seated session.
@@ -45,26 +42,15 @@ async fn main() -> Result<()> {
     let log_level = match args.verbose {0 => "info", 1 => "debug", _ => "trace"};
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
-    let cfg = Config::new(args.socket, args.owner, args.user_socket);
-    let active_sessions: Arc<RwLock<HashMap<OwnedObjectPath, Session>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-    tokio::spawn(monitor_sessions(active_sessions.clone(), cfg.clone()));
+    let cfg = Arc::new(Config::new(args.socket, args.owner, args.user_socket));
+    let monitor = Arc::new(SessionMonitor::new(cfg.clone()).await?);
+    let monitor_ = monitor.clone();
     tokio::spawn(setup_process_signal_handlers(cfg.socket.clone()));
-    socket_server(cfg, active_sessions).await
+    tokio::spawn(async move { monitor_.run().await });
+    socket_server(cfg, monitor).await
 }
 
-async fn monitor_sessions(
-    active_sessions: Arc<RwLock<HashMap<OwnedObjectPath, Session>>>,
-    cfg: Config,
-) -> Result<()> {
-    let monitor = SessionMonitor::new(active_sessions, cfg).await?;
-    monitor.monitor().await
-}
-
-async fn socket_server(
-    cfg: Config,
-    active_sessions: Arc<RwLock<HashMap<OwnedObjectPath, Session>>>,
-) -> Result<()> {
+async fn socket_server(cfg: Arc<Config>, monitor: Arc<SessionMonitor>) -> Result<()> {
     if !cfg.socket.parent().map(|p| p.is_dir()).unwrap_or(false) {
         anyhow::bail!("Socket directory not found: {:?}", cfg.socket);
     }
@@ -81,7 +67,7 @@ async fn socket_server(
     debug!("Serving {:?}", cfg.socket);
     loop {
         let (stream, _addr) = listener.accept().await?;
-        if let Some(session) = get_active_session(&active_sessions).await {
+        if let Some(session) = monitor.get_active_session().await {
             trace!("Relaying to session {} on {:?}", session.id, session.user_socket);
             match relay_message(stream, &session.user_socket).await {
                 Ok(()) => trace!("Relay to session {} completed", session.id),
@@ -91,17 +77,6 @@ async fn socket_server(
             trace!("No active session");
         }
     }
-}
-
-async fn get_active_session(
-    active_sessions: &Arc<RwLock<HashMap<OwnedObjectPath, Session>>>,
-) -> Option<Session> {
-    let active = active_sessions.read().await;
-    if active.len() > 1 {
-        warn!("Unexpected: multiple active sessions: {:?}", active.keys());
-        return None;
-    }
-    active.values().next().cloned()
 }
 
 async fn relay_message(mut in_stream: UnixStream, user_socket: &Path) -> Result<()> {
@@ -148,12 +123,6 @@ async fn relay_message(mut in_stream: UnixStream, user_socket: &Path) -> Result<
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-struct Session {
-    id: String,
-    user_socket: PathBuf,
-}
-
 async fn setup_process_signal_handlers(socket: PathBuf) {
     let mut sigterm = signal(SignalKind::terminate()).expect("Failed to setup SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("Failed to setup SIGINT handler");
@@ -197,28 +166,4 @@ impl Config {
     fn user_socket_path(&self, uid: u32) -> PathBuf {
         PathBuf::from(self.user_socket.replace("{uid}", &uid.to_string()))
     }
-}
-
-#[zbus::proxy(
-    interface = "org.freedesktop.login1.Manager",
-    default_service = "org.freedesktop.login1",
-    default_path = "/org/freedesktop/login1"
-)]
-trait Manager {
-    fn list_sessions(&self) -> zbus::Result<Vec<(String, u32, String, String, OwnedObjectPath)>>;
-}
-
-#[zbus::proxy(
-    interface = "org.freedesktop.login1.Session",
-    default_service = "org.freedesktop.login1"
-)]
-trait Session {
-    #[zbus(property)]
-    fn seat(&self) -> zbus::Result<(String, OwnedObjectPath)>;
-
-    #[zbus(property)]
-    fn user(&self) -> zbus::Result<(u32, OwnedObjectPath)>;
-
-    #[zbus(property)]
-    fn active(&self) -> zbus::Result<bool>;
 }

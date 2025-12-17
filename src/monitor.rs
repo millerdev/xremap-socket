@@ -2,16 +2,17 @@ use anyhow::Result;
 use futures_util::stream::StreamExt;
 use log::{debug, info, warn};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use zbus::{Connection, MatchRule, Message, MessageStream};
 use zbus::fdo::DBusProxy;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
-use crate::{Config, Session, ManagerProxy, SessionProxy};
+use crate::{Config};
 
 pub struct SessionMonitor {
-    cfg: Config,
+    cfg: Arc<Config>,
     sessions: Arc<RwLock<HashMap<OwnedObjectPath, Session>>>,
     active_sessions: Arc<RwLock<HashMap<OwnedObjectPath, Session>>>,
     connection: Connection,
@@ -19,23 +20,28 @@ pub struct SessionMonitor {
 }
 
 impl SessionMonitor {
-    pub async fn new(
-        active_sessions: Arc<RwLock<HashMap<OwnedObjectPath, Session>>>,
-        cfg: Config,
-    ) -> Result<Self> {
+    pub async fn new(cfg: Arc<Config>) -> Result<Self> {
         let connection = Connection::system().await?;
         let proxy = DBusProxy::new(&connection).await?;
-
         Ok(SessionMonitor {
             cfg,
             sessions: Arc::new(RwLock::new(HashMap::new())),
-            active_sessions,
+            active_sessions: Arc::new(RwLock::new(HashMap::new())),
             connection,
             proxy,
         })
     }
 
-    pub async fn monitor(&self) -> Result<()> {
+    pub async fn get_active_session(&self) -> Option<Session> {
+        let active = self.active_sessions.read().await;
+        if active.len() > 1 {
+            warn!("Unexpected: multiple active sessions: {:?}", active.keys());
+            return None;
+        }
+        active.values().next().cloned()
+    }
+
+    pub async fn run(&self) -> Result<()> {
         let session_new_rule = MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .interface("org.freedesktop.login1.Manager")?
@@ -202,4 +208,34 @@ fn session_changed_rule(session_path: &OwnedObjectPath) -> Result<MatchRule<'_>>
         .path(session_path)?
         .member("PropertiesChanged")?
         .build())
+}
+
+#[derive(Clone, Debug)]
+pub struct Session {
+    pub id: String,
+    pub user_socket: PathBuf,
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.Manager",
+    default_service = "org.freedesktop.login1",
+    default_path = "/org/freedesktop/login1"
+)]
+trait Manager {
+    fn list_sessions(&self) -> zbus::Result<Vec<(String, u32, String, String, OwnedObjectPath)>>;
+}
+
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.Session",
+    default_service = "org.freedesktop.login1"
+)]
+trait Session {
+    #[zbus(property)]
+    fn seat(&self) -> zbus::Result<(String, OwnedObjectPath)>;
+
+    #[zbus(property)]
+    fn user(&self) -> zbus::Result<(u32, OwnedObjectPath)>;
+
+    #[zbus(property)]
+    fn active(&self) -> zbus::Result<bool>;
 }
