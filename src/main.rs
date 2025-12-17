@@ -81,8 +81,7 @@ async fn socket_server(cfg: Arc<Config>, monitor: Arc<SessionMonitor>) -> Result
 
 async fn relay_message(mut in_stream: UnixStream, user_socket: &Path) -> Result<()> {
     if !user_socket.exists() {
-        trace!("Abort relay: {:?} does not exist", user_socket);
-        return Ok(());
+        return Err(anyhow::format_err!("{:?} not found", user_socket));
     }
     let mut out_stream = UnixStream::connect(user_socket).await?;
     let (mut in_read, mut in_write) = in_stream.split();
