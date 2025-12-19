@@ -36,7 +36,7 @@ async def main():
     )
     parser.add_argument(
         "-u", "--user-socket",
-        default="/run/user/{uid}/gnome.sock",
+        default="/run/xremap/{uid}/gnome.sock",
         help="User socket pattern"
     )
     parser.add_argument(

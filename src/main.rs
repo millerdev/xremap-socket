@@ -28,7 +28,7 @@ struct Args {
     owner: String,
 
     /// User socket pattern. '{uid}' will be replaced with the active user id.
-    #[arg(short, long, default_value = "/run/user/{uid}/gnome.sock")]
+    #[arg(short, long, default_value = "/run/xremap/{uid}/gnome.sock")]
     user_socket: String,
 
     /// Enable debug logging. Repeat for more detail.
