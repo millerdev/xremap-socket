@@ -186,23 +186,35 @@ async def relay_message(socket_path: Path, in_reader: aio.StreamReader, in_write
         if not socket_path.exists():
             log.trace("Abort relay: %s does not exist", socket_path)
             return
-        out_reader, out_writer = await aio.open_unix_connection(socket_path)
+        out_reader, out_writer = await timeout(aio.open_unix_connection(socket_path))
         try:
             async for request in in_reader:
                 log.trace("Message: %r", request)
                 out_writer.write(request)
-                await out_writer.drain()
-                async for response in out_reader:
+                await timeout(out_writer.drain())
+                itr = aiter(out_reader)
+                while True:
+                    try:
+                        response = await timeout(anext(itr))
+                    except StopAsyncIteration:
+                        break
                     log.trace("Response: %r", response)
                     in_writer.write(response)
                     await in_writer.drain()
         finally:
             out_writer.close()
             await out_writer.wait_closed()
+    except aio.TimeoutError:
+        log.warning("Timeout waiting for user socket")
+        return
     finally:
         in_writer.close()
         await in_writer.wait_closed()
     log.trace("Relay to %s completed", socket_path)
+
+
+async def timeout(future, timeout=1):
+    return await aio.wait_for(future, timeout=timeout)
 
 
 class add_trace_logging_level():

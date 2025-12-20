@@ -6,12 +6,14 @@ use clap::Parser;
 use log::{debug, error, trace};
 use monitor::SessionMonitor;
 use std::fs;
+use std::io::{Error, ErrorKind};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::time::{timeout, Duration};
 use users::get_user_by_name;
 
 /// Relay from /run/xremap/gnome.sock to /run/user/{uid}/gnome.sock
@@ -104,7 +106,10 @@ async fn relay_message(mut in_stream: UnixStream, user_socket: &Path) -> Result<
     let relay_out = async {
         let mut buffer = vec![0u8; 4096];
         loop {
-            let n = out_read.read(&mut buffer).await?;
+            let n = match timeout(Duration::from_secs(1), out_read.read(&mut buffer)).await {
+                Ok(result) => result?,
+                Err(_) => return Err(Error::new(ErrorKind::TimedOut, "Read timeout")),
+            };
             if n == 0 {
                 break;
             }
