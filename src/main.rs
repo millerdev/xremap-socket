@@ -120,10 +120,9 @@ async fn relay_message(mut in_stream: UnixStream, user_socket: &Path) -> Result<
         Ok::<(), std::io::Error>(())
     };
 
-    tokio::select! {
-        res = relay_in => res?,
-        res = relay_out => res?,
-    }
+    if let Err(why) = tokio::try_join!(relay_in, relay_out) {
+        anyhow::bail!(why);
+    };
     Ok(())
 }
 
