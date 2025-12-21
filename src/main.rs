@@ -104,7 +104,7 @@ async fn relay_message(mut in_stream: UnixStream, user_socket: &Path) -> Result<
     };
 
     let relay_out = async {
-        let mut buffer = vec![0u8; 4096];
+        let mut buffer = [0u8; 4096];
         loop {
             let n = match timeout(Duration::from_secs(1), out_read.read(&mut buffer)).await {
                 Ok(result) => result?,
