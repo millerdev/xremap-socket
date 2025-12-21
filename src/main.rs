@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
     let log_level = match args.verbose {0 => "info", 1 => "debug", _ => "trace"};
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
-    let cfg = Arc::new(Config::new(args.socket, args.owner, args.user_socket));
+    let cfg = Arc::new(args);
     let monitor = Arc::new(SessionMonitor::new(cfg.clone()).await?);
     let monitor_ = monitor.clone();
     tokio::spawn(setup_process_signal_handlers(cfg.socket.clone()));
@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     socket_server(cfg, monitor).await
 }
 
-async fn socket_server(cfg: Arc<Config>, monitor: Arc<SessionMonitor>) -> Result<()> {
+async fn socket_server(cfg: Arc<Args>, monitor: Arc<SessionMonitor>) -> Result<()> {
     if !cfg.socket.parent().map(|p| p.is_dir()).unwrap_or(false) {
         anyhow::bail!("Socket directory not found: {:?}", cfg.socket);
     }
@@ -148,26 +148,5 @@ fn cleanup(socket: PathBuf) {
             Ok(()) => debug!("Removed {:?}", socket),
             Err(why) => error!("Failed to remove {:?}: {}", socket, why),
         }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct Config {
-    socket: PathBuf,
-    owner: String,
-    user_socket: String,
-}
-
-impl Config {
-    fn new(socket: PathBuf, owner: String, user_socket: String) -> Config {
-        Config {
-            socket,
-            owner,
-            user_socket,
-        }
-    }
-
-    fn user_socket_path(&self, uid: u32) -> PathBuf {
-        PathBuf::from(self.user_socket.replace("{uid}", &uid.to_string()))
     }
 }

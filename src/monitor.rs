@@ -9,10 +9,10 @@ use zbus::{Connection, MatchRule, Message, MessageStream};
 use zbus::fdo::DBusProxy;
 use zbus::zvariant::{OwnedObjectPath, Value};
 
-use crate::{Config};
+use crate::{Args};
 
 pub struct SessionMonitor {
-    cfg: Arc<Config>,
+    cfg: Arc<Args>,
     sessions: Arc<RwLock<HashMap<OwnedObjectPath, Session>>>,
     active_sessions: Arc<RwLock<HashMap<OwnedObjectPath, Session>>>,
     connection: Connection,
@@ -20,7 +20,7 @@ pub struct SessionMonitor {
 }
 
 impl SessionMonitor {
-    pub async fn new(cfg: Arc<Config>) -> Result<Self> {
+    pub async fn new(cfg: Arc<Args>) -> Result<Self> {
         let connection = Connection::system().await?;
         let proxy = DBusProxy::new(&connection).await?;
         Ok(SessionMonitor {
@@ -129,7 +129,7 @@ impl SessionMonitor {
         let is_active = session_proxy.active().await?;
         let session = Session {
             id: session_id.clone(),
-            user_socket: self.cfg.user_socket_path(uid),
+            user_socket: user_socket_path(self.cfg.user_socket.clone(), uid),
         };
         let active_str = if is_active { " active" } else { "" };
         info!("Monitoring{} session {} (uid={}, seat={})", active_str, session_id, uid, seat_id);
@@ -173,7 +173,7 @@ impl SessionMonitor {
             let is_active = session_proxy.active().await?;
             let session = Session {
                 id: session_id.clone(),
-                user_socket: self.cfg.user_socket_path(uid),
+                user_socket: user_socket_path(self.cfg.user_socket.clone(), uid),
             };
             if is_active {
                 self.active_sessions.write().await.insert(session_path.clone(), session.clone());
@@ -208,6 +208,10 @@ fn session_changed_rule(session_path: &OwnedObjectPath) -> Result<MatchRule<'_>>
         .path(session_path)?
         .member("PropertiesChanged")?
         .build())
+}
+
+fn user_socket_path(user_socket: String, uid: u32) -> PathBuf {
+    PathBuf::from(user_socket.replace("{uid}", &uid.to_string()))
 }
 
 #[derive(Clone, Debug)]
