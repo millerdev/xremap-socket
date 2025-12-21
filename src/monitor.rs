@@ -4,7 +4,7 @@ use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use zbus::{Connection, MatchRule, Message, MessageStream};
 use zbus::fdo::DBusProxy;
 use zbus::zvariant::{OwnedObjectPath, Value};
@@ -13,8 +13,8 @@ use crate::{Args};
 
 pub struct SessionMonitor {
     cfg: Arc<Args>,
-    sessions: Arc<RwLock<HashMap<OwnedObjectPath, Session>>>,
-    active_sessions: Arc<RwLock<HashMap<OwnedObjectPath, Session>>>,
+    sessions: Arc<Mutex<HashMap<OwnedObjectPath, Session>>>,
+    active_sessions: Arc<Mutex<HashMap<OwnedObjectPath, Session>>>,
     connection: Connection,
     proxy: DBusProxy<'static>,
 }
@@ -25,15 +25,15 @@ impl SessionMonitor {
         let proxy = DBusProxy::new(&connection).await?;
         Ok(SessionMonitor {
             cfg,
-            sessions: Arc::new(RwLock::new(HashMap::new())),
-            active_sessions: Arc::new(RwLock::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            active_sessions: Arc::new(Mutex::new(HashMap::new())),
             connection,
             proxy,
         })
     }
 
     pub async fn get_active_session(&self) -> Option<Session> {
-        let active = self.active_sessions.read().await;
+        let active = self.active_sessions.lock().await;
         if active.len() > 1 {
             warn!("Unexpected: multiple active sessions: {:?}", active.keys());
             return None;
@@ -98,8 +98,8 @@ impl SessionMonitor {
             "SessionRemoved" => {
                 let (session_id, session_path): (String, OwnedObjectPath) =
                     message.body().deserialize()?;
-                let session = self.sessions.write().await.remove(&session_path);
-                let active = self.active_sessions.write().await.remove(&session_path);
+                let session = self.sessions.lock().await.remove(&session_path);
+                let active = self.active_sessions.lock().await.remove(&session_path);
                 if session.is_some() || active.is_some() {
                     self.remove_properties_changed_match_rule(&session_path).await?;
                     if session.is_some() {
@@ -134,9 +134,9 @@ impl SessionMonitor {
         let active_str = if is_active { " active" } else { "" };
         info!("Monitoring{} session {} (uid={}, seat={})", active_str, session_id, uid, seat_id);
         self.add_properties_changed_match_rule(&session_path).await?;
-        self.sessions.write().await.insert(session_path.clone(), session.clone());
+        self.sessions.lock().await.insert(session_path.clone(), session.clone());
         if is_active {
-            self.active_sessions.write().await.insert(session_path.clone(), session);
+            self.active_sessions.lock().await.insert(session_path.clone(), session);
         }
         Ok(())
     }
@@ -147,8 +147,8 @@ impl SessionMonitor {
         changed: HashMap<String, Value<'_>>,
     ) {
         if let Some(Value::Bool(is_active)) = changed.get("Active") {
-            if let Some(session) = self.sessions.write().await.get(&session_path) {
-                let mut active_guard = self.active_sessions.write().await;
+            if let Some(session) = self.sessions.lock().await.get(&session_path) {
+                let mut active_guard = self.active_sessions.lock().await;
                 if *is_active {
                     debug!("Activated session {}", session.id);
                     active_guard.insert(session_path.clone(), session.clone());
@@ -176,9 +176,9 @@ impl SessionMonitor {
                 user_socket: user_socket_path(self.cfg.user_socket.clone(), uid),
             };
             if is_active {
-                self.active_sessions.write().await.insert(session_path.clone(), session.clone());
+                self.active_sessions.lock().await.insert(session_path.clone(), session.clone());
             }
-            self.sessions.write().await.insert(session_path.clone(), session);
+            self.sessions.lock().await.insert(session_path.clone(), session);
             self.add_properties_changed_match_rule(&session_path).await?
         }
         Ok(())
