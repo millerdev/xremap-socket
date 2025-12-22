@@ -69,7 +69,7 @@ async fn socket_server(cfg: Arc<Args>, monitor: Arc<SessionMonitor>) -> Result<(
     debug!("Serving {:?}", cfg.socket);
     loop {
         let (stream, _addr) = listener.accept().await?;
-        if let Some(session) = monitor.get_active_session().await {
+        if let Some(session) = monitor.get_active_session() {
             trace!("Relaying to session {} on {:?}", session.id, session.user_socket);
             match relay_message(stream, &session.user_socket).await {
                 Ok(()) => trace!("Relay to session {} completed", session.id),
