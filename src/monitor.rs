@@ -120,7 +120,7 @@ impl SessionMonitor {
         let is_active = session_proxy.active().await?;
         let session = Session {
             id: session_id.clone(),
-            user_socket: user_socket_path(self.cfg.user_socket.clone(), uid),
+            user_socket: user_socket_path(&self.cfg.user_socket, uid),
         };
         let active_str = if is_active { " active" } else { "" };
         info!("Monitoring{} session {} (uid={}, seat={})", active_str, session_id, uid, seat_id);
@@ -161,7 +161,7 @@ impl SessionMonitor {
             let is_active = session_proxy.active().await?;
             let session = Session {
                 id: session_id.clone(),
-                user_socket: user_socket_path(self.cfg.user_socket.clone(), uid),
+                user_socket: user_socket_path(&self.cfg.user_socket, uid),
             };
             self.sessions.lock().unwrap().insert(session_path.clone(), session, is_active);
             self.add_properties_changed_match_rule(&session_path).await?
@@ -195,7 +195,7 @@ fn session_changed_rule(session_path: &OwnedObjectPath) -> Result<MatchRule<'_>>
         .build())
 }
 
-fn user_socket_path(user_socket: String, uid: u32) -> PathBuf {
+fn user_socket_path(user_socket: &String, uid: u32) -> PathBuf {
     PathBuf::from(user_socket.replace("{uid}", &uid.to_string()))
 }
 
