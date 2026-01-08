@@ -46,8 +46,9 @@ sudo chmod 644 /etc/xremap/config.yml
 ### Create _xremap_ user and groups
 
 ```sh
-# Add system xremap user
-sudo useradd --system --no-create-home --shell=/bin/false xremap
+# Add system xremap group and user
+sudo groupadd --system xremap
+sudo useradd --system --no-create-home --shell=/bin/false -g xremap xremap
 
 # Add a xremap-{username} group for each user that will use xremap.
 # Replace {usernameN} with the username.
@@ -78,6 +79,7 @@ After=xremap-socket.service
 ExecStart=/usr/bin/xremap --watch=config,device /etc/xremap/config.yml
 Environment=GNOME_SOCKET=/run/xremap/gnome.sock
 User=xremap
+Group=xremap
 SupplementaryGroups=input
 Restart=always
 
@@ -105,6 +107,7 @@ Description=Xremap socket manager
 [Service]
 ExecStart=/usr/local/bin/xremap-socket
 User=xremap
+Group=xremap
 Restart=always
 RuntimeDirectory=xremap
 RuntimeDirectoryMode=0755
